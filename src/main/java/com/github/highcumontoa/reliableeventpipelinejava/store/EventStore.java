@@ -2,6 +2,7 @@ package com.github.highcumontoa.reliableeventpipelinejava.store;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.github.highcumontoa.reliableeventpipelinejava.core.BacklogStats;
 import com.github.highcumontoa.reliableeventpipelinejava.core.BusinessRecord;
 import com.github.highcumontoa.reliableeventpipelinejava.core.ClaimDecision;
 import com.github.highcumontoa.reliableeventpipelinejava.core.DeadReason;
@@ -11,6 +12,7 @@ import com.github.highcumontoa.reliableeventpipelinejava.core.EventStatus;
 import com.github.highcumontoa.reliableeventpipelinejava.core.FailureKind;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineEvent;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineStats;
+import com.github.highcumontoa.reliableeventpipelinejava.pipeline.BackpressureRejectedException;
 import com.github.highcumontoa.reliableeventpipelinejava.pipeline.EventNotFoundException;
 import com.github.highcumontoa.reliableeventpipelinejava.pipeline.IllegalRedeliveryException;
 import java.io.IOException;
@@ -47,6 +49,7 @@ public class EventStore {
     private final Map<String, BusinessRecord> businessRecords = new LinkedHashMap<>();
     private final Map<String, EffectRecord> effects = new HashMap<>();
     private final Map<String, Long> nextSeqByAggregate = new HashMap<>();
+    private final Set<String> pausedAggregates = new HashSet<>();
 
     public EventStore(Path storeFile) {
         this.storeFile = storeFile;
@@ -67,6 +70,7 @@ public class EventStore {
                 businessRecords.clear();
                 effects.clear();
                 nextSeqByAggregate.clear();
+                pausedAggregates.clear();
                 for (PipelineEvent e : nullToEmpty(snapshot.events)) {
                     events.put(e.eventId, e);
                     eventIdByIdempotencyKey.put(e.idempotencyKey, e.eventId);
@@ -80,6 +84,9 @@ public class EventStore {
                 if (snapshot.nextSeqByAggregate != null) {
                     nextSeqByAggregate.putAll(snapshot.nextSeqByAggregate);
                 }
+                if (snapshot.pausedAggregates != null) {
+                    pausedAggregates.addAll(snapshot.pausedAggregates);
+                }
             } catch (IOException e) {
                 throw new UncheckedIOException("加载存储快照失败: " + storeFile, e);
             }
@@ -92,10 +99,40 @@ public class EventStore {
      */
     public PipelineEvent commitBusinessWithEvent(String idempotencyKey, String aggregateId,
             String businessData, String payload, Instant now) {
+        return commitBusinessWithEvent(idempotencyKey, aggregateId, businessData, payload,
+                null, null, 0, now);
+    }
+
+    /**
+     * 业务写入与事件入队的原子提交（完整语义）。
+     * <ul>
+     *   <li>幂等：同一 idempotencyKey 重复提交直接返回已存在事件，不触发背压检查。</li>
+     *   <li>背压：maxBacklogPerAggregate &gt; 0 且该聚合未完成事件数已达上限时，
+     *       抛 BackpressureRejectedException，业务记录与事件都不写入（原子地整体失败）。</li>
+     *   <li>延迟：deliverAt 非空时事件在该时间之前不可被认领；若剩余等待超过 maxDelay，
+     *       事件直接以 DELAY_EXCEEDED 死信落库（业务记录仍与事件同事务提交，可排查后重投）。</li>
+     * </ul>
+     */
+    public PipelineEvent commitBusinessWithEvent(String idempotencyKey, String aggregateId,
+            String businessData, String payload, Instant deliverAt,
+            Duration maxDelay, int maxBacklogPerAggregate, Instant now) {
         synchronized (lock) {
             String existingId = eventIdByIdempotencyKey.get(idempotencyKey);
             if (existingId != null) {
                 return copy(events.get(existingId));
+            }
+            if (maxBacklogPerAggregate > 0) {
+                long backlog = 0;
+                for (PipelineEvent e : events.values()) {
+                    if (e.aggregateId.equals(aggregateId)
+                            && (e.status == EventStatus.PENDING || e.status == EventStatus.IN_FLIGHT)) {
+                        backlog++;
+                    }
+                }
+                if (backlog >= maxBacklogPerAggregate) {
+                    // 拒绝发生在任何写入之前：业务与事件都不会落库，不存在半截状态。
+                    throw new BackpressureRejectedException(aggregateId, backlog, maxBacklogPerAggregate);
+                }
             }
             BusinessRecord record = new BusinessRecord();
             record.idempotencyKey = idempotencyKey;
@@ -113,8 +150,15 @@ public class EventStore {
             event.deliveryAttempts = 0;
             event.redeliveries = 0;
             event.nextAttemptAt = now;
+            event.deliverAt = deliverAt;
             event.createdAt = now;
             event.updatedAt = now;
+            if (deliverAt != null && maxDelay != null && deliverAt.isAfter(now.plus(maxDelay))) {
+                // 等待超过上限：不能一直挂着，以可区分的死信原因处理掉。
+                event.status = EventStatus.DEAD;
+                event.deadReason = DeadReason.DELAY_EXCEEDED;
+                event.lastError = "延迟等待超过上限 " + maxDelay + ": deliverAt=" + deliverAt;
+            }
 
             // 同一锁内同时写入业务记录与事件并落盘：要么都成功，要么都失败。
             businessRecords.put(idempotencyKey, record);
@@ -131,18 +175,40 @@ public class EventStore {
      * 再跳过存在在途事件的聚合，保证同一聚合按提交顺序逐个投递。
      */
     public Optional<PipelineEvent> claimNext(String owner, Duration claimTimeout, Instant now) {
+        return claimNext(owner, claimTimeout, null, now);
+    }
+
+    /**
+     * 认领一个可投递事件（完整语义）。
+     * <ul>
+     *   <li>回收超时认领；清扫剩余等待超过 maxDelay 的延迟事件为 DELAY_EXCEEDED 死信。</li>
+     *   <li>跳过暂停的聚合；跳过 deliverAt 未到的事件。</li>
+     *   <li>聚合内队首阻塞：只有该聚合最早未完成（PENDING/IN_FLIGHT）的事件可被认领，
+     *       前面的事件没到点或还在途时，后面的事件不能抢先。</li>
+     * </ul>
+     */
+    public Optional<PipelineEvent> claimNext(String owner, Duration claimTimeout,
+            Duration maxDelay, Instant now) {
         synchronized (lock) {
             boolean changed = reclaimExpiredLocked(now);
+            changed |= expireOverdelayedLocked(maxDelay, now);
             Set<String> busyAggregates = new HashSet<>();
+            Map<String, Long> headSeqByAggregate = new HashMap<>();
             for (PipelineEvent e : events.values()) {
                 if (e.status == EventStatus.IN_FLIGHT) {
                     busyAggregates.add(e.aggregateId);
+                }
+                if (e.status == EventStatus.PENDING || e.status == EventStatus.IN_FLIGHT) {
+                    headSeqByAggregate.merge(e.aggregateId, e.seq, Math::min);
                 }
             }
             for (PipelineEvent e : events.values()) {
                 if (e.status != EventStatus.PENDING
                         || busyAggregates.contains(e.aggregateId)
-                        || e.nextAttemptAt.isAfter(now)) {
+                        || pausedAggregates.contains(e.aggregateId)
+                        || e.nextAttemptAt.isAfter(now)
+                        || (e.deliverAt != null && e.deliverAt.isAfter(now))
+                        || e.seq != headSeqByAggregate.get(e.aggregateId)) {
                     continue;
                 }
                 e.status = EventStatus.IN_FLIGHT;
@@ -223,6 +289,36 @@ public class EventStore {
             e.updatedAt = now;
             persistLocked();
             return copy(e);
+        }
+    }
+
+    /** 暂停某个聚合的投递：暂停期间该聚合的事件不可被认领，其他聚合不受影响。 */
+    public void pauseAggregate(String aggregateId) {
+        synchronized (lock) {
+            if (pausedAggregates.add(aggregateId)) {
+                persistLocked();
+            }
+        }
+    }
+
+    /** 恢复某个聚合的投递：从暂停前的位置按顺序继续，暂停期间的事件不丢不算失败。 */
+    public void resumeAggregate(String aggregateId) {
+        synchronized (lock) {
+            if (pausedAggregates.remove(aggregateId)) {
+                persistLocked();
+            }
+        }
+    }
+
+    public boolean isPaused(String aggregateId) {
+        synchronized (lock) {
+            return pausedAggregates.contains(aggregateId);
+        }
+    }
+
+    public Set<String> pausedAggregates() {
+        synchronized (lock) {
+            return Set.copyOf(pausedAggregates);
         }
     }
 
@@ -344,6 +440,53 @@ public class EventStore {
         return changed;
     }
 
+    /** 清扫剩余等待超过上限的延迟事件：以 DELAY_EXCEEDED 死信处理，不能一直挂着。 */
+    private boolean expireOverdelayedLocked(Duration maxDelay, Instant now) {
+        if (maxDelay == null) {
+            return false;
+        }
+        boolean changed = false;
+        for (PipelineEvent e : events.values()) {
+            if (e.status == EventStatus.PENDING
+                    && e.deliverAt != null && e.deliverAt.isAfter(now.plus(maxDelay))) {
+                e.status = EventStatus.DEAD;
+                e.deadReason = DeadReason.DELAY_EXCEEDED;
+                e.lastError = "延迟等待超过上限 " + maxDelay + ": deliverAt=" + e.deliverAt;
+                e.updatedAt = now;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /** 积压水位：按聚合与全局统计未完成（PENDING + IN_FLIGHT）事件数与最久积压时长。 */
+    public BacklogStats backlogStats(Instant now) {
+        synchronized (lock) {
+            Map<String, long[]> byAggregate = new HashMap<>(); // aggregateId -> [count, oldestCreatedAtMillis]
+            long total = 0;
+            Long oldestMillis = null;
+            for (PipelineEvent e : events.values()) {
+                if (e.status != EventStatus.PENDING && e.status != EventStatus.IN_FLIGHT) {
+                    continue;
+                }
+                total++;
+                long created = e.createdAt.toEpochMilli();
+                long[] agg = byAggregate.computeIfAbsent(e.aggregateId,
+                        k -> new long[] {0L, Long.MAX_VALUE});
+                agg[0]++;
+                agg[1] = Math.min(agg[1], created);
+                oldestMillis = oldestMillis == null ? created : Math.min(oldestMillis, created);
+            }
+            Map<String, BacklogStats.AggregateBacklog> detail = new LinkedHashMap<>();
+            byAggregate.forEach((aggregateId, agg) -> detail.put(aggregateId,
+                    new BacklogStats.AggregateBacklog(agg[0],
+                            Math.max(0, now.toEpochMilli() - agg[1]))));
+            return new BacklogStats(total,
+                    oldestMillis == null ? null : Math.max(0, now.toEpochMilli() - oldestMillis),
+                    detail);
+        }
+    }
+
     /** 锁内原子写盘：先写临时文件再原子移动，避免半写状态。 */
     private void persistLocked() {
         Snapshot snapshot = new Snapshot();
@@ -351,6 +494,7 @@ public class EventStore {
         snapshot.businessRecords = new ArrayList<>(businessRecords.values());
         snapshot.effects = new ArrayList<>(effects.values());
         snapshot.nextSeqByAggregate = new HashMap<>(nextSeqByAggregate);
+        snapshot.pausedAggregates = new HashSet<>(pausedAggregates);
         try {
             Path parent = storeFile.toAbsolutePath().getParent();
             if (parent != null) {
@@ -387,5 +531,6 @@ public class EventStore {
         public List<BusinessRecord> businessRecords;
         public List<EffectRecord> effects;
         public Map<String, Long> nextSeqByAggregate;
+        public Set<String> pausedAggregates;
     }
 }

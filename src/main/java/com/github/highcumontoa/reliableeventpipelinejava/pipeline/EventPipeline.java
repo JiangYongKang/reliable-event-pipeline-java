@@ -1,5 +1,6 @@
 package com.github.highcumontoa.reliableeventpipelinejava.pipeline;
 
+import com.github.highcumontoa.reliableeventpipelinejava.core.BacklogStats;
 import com.github.highcumontoa.reliableeventpipelinejava.core.ClaimDecision;
 import com.github.highcumontoa.reliableeventpipelinejava.core.FailureKind;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineEvent;
@@ -73,7 +74,40 @@ public class EventPipeline {
 
     /** 业务写入与事件入队的原子提交；重复幂等键不产生重复事件。 */
     public PipelineEvent submit(String idempotencyKey, String aggregateId, String businessData, String payload) {
-        return store.commitBusinessWithEvent(idempotencyKey, aggregateId, businessData, payload, Instant.now());
+        return submit(idempotencyKey, aggregateId, businessData, payload, null);
+    }
+
+    /**
+     * 业务写入与事件入队的原子提交，可指定最早可投递时间。
+     * 聚合积压达到上限时抛 BackpressureRejectedException（业务与事件均未写入）；
+     * 剩余等待超过 maxDelay 时事件以 DELAY_EXCEEDED 死信落库。
+     */
+    public PipelineEvent submit(String idempotencyKey, String aggregateId,
+            String businessData, String payload, Instant deliverAt) {
+        return store.commitBusinessWithEvent(idempotencyKey, aggregateId, businessData, payload,
+                deliverAt, properties.getMaxDelay(), properties.getMaxBacklogPerAggregate(),
+                Instant.now());
+    }
+
+    /** 暂停某个聚合的投递。 */
+    public void pauseAggregate(String aggregateId) {
+        store.pauseAggregate(aggregateId);
+        log.info("聚合已暂停投递 aggregate={}", aggregateId);
+    }
+
+    /** 恢复某个聚合的投递，从暂停前的位置按顺序继续。 */
+    public void resumeAggregate(String aggregateId) {
+        store.resumeAggregate(aggregateId);
+        log.info("聚合已恢复投递 aggregate={}", aggregateId);
+    }
+
+    public boolean isPaused(String aggregateId) {
+        return store.isPaused(aggregateId);
+    }
+
+    /** 积压水位：全局与按聚合的未完成事件数及最久积压时长。 */
+    public BacklogStats backlogStats() {
+        return store.backlogStats(Instant.now());
     }
 
     /** 死信重投；状态非法时抛 IllegalRedeliveryException。 */
@@ -97,7 +131,8 @@ public class EventPipeline {
         while (running.get() && !Thread.currentThread().isInterrupted()) {
             Optional<PipelineEvent> claimed;
             try {
-                claimed = store.claimNext(owner, properties.getClaimTimeout(), Instant.now());
+                claimed = store.claimNext(owner, properties.getClaimTimeout(),
+                        properties.getMaxDelay(), Instant.now());
             } catch (RuntimeException e) {
                 log.error("认领事件失败 owner={}", owner, e);
                 sleep();

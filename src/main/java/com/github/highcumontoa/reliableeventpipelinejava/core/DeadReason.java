@@ -5,5 +5,7 @@ public enum DeadReason {
     /** 重试次数耗尽。 */
     RETRIES_EXHAUSTED,
     /** 不可重试故障。 */
-    NON_RETRYABLE_FAILURE
+    NON_RETRYABLE_FAILURE,
+    /** 延迟等待超过可配置上限，被直接处理掉。 */
+    DELAY_EXCEEDED
 }

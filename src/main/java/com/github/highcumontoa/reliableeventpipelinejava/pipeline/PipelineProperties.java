@@ -20,6 +20,10 @@ public class PipelineProperties {
     private Duration pollInterval = Duration.ofMillis(20);
     /** 状态文件路径（进程内可恢复存储）。 */
     private String storeFile = "data/pipeline-store.json";
+    /** 延迟投递的最大等待时长，超过上限的事件以 DELAY_EXCEEDED 死信处理。 */
+    private Duration maxDelay = Duration.ofHours(24);
+    /** 单个聚合允许的最大积压（未完成事件数），达到上限后新提交被背压拒绝；<=0 表示不限制。 */
+    private int maxBacklogPerAggregate = 1000;
 
     public int getMaxDeliveryAttempts() {
         return maxDeliveryAttempts;
@@ -75,5 +79,21 @@ public class PipelineProperties {
 
     public void setStoreFile(String storeFile) {
         this.storeFile = storeFile;
+    }
+
+    public Duration getMaxDelay() {
+        return maxDelay;
+    }
+
+    public void setMaxDelay(Duration maxDelay) {
+        this.maxDelay = maxDelay;
+    }
+
+    public int getMaxBacklogPerAggregate() {
+        return maxBacklogPerAggregate;
+    }
+
+    public void setMaxBacklogPerAggregate(int maxBacklogPerAggregate) {
+        this.maxBacklogPerAggregate = maxBacklogPerAggregate;
     }
 }
