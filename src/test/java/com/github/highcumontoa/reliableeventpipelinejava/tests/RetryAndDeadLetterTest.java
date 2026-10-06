@@ -135,6 +135,10 @@ class RetryAndDeadLetterTest {
     @Test
     void failingAggregateDoesNotBlockOtherAggregates() throws Exception {
         EventPipeline pipeline = newPipeline("isolation.json", 2, 3);
+        // 先一次性提交全部事件，避免处理线程在后续提交前就处理完导致的轮询竞态
+        PipelineEvent bad = pipeline.submit("k-bad", "agg-bad", "d", "p");
+        PipelineEvent good1 = pipeline.submit("k-good-1", "agg-good", "d", "p1");
+        PipelineEvent good2 = pipeline.submit("k-good-2", "agg-good", "d", "p2");
         pipeline.start((event, context) -> {
             if (event.aggregateId.equals("agg-bad")) {
                 log.info("处理失败 eventId={} 第{}次尝试, 判定依据: 聚合agg-bad持续故障",
@@ -142,9 +146,6 @@ class RetryAndDeadLetterTest {
                 throw EventProcessingException.retryable("agg-bad always fails");
             }
         });
-        PipelineEvent bad = pipeline.submit("k-bad", "agg-bad", "d", "p");
-        PipelineEvent good1 = pipeline.submit("k-good-1", "agg-good", "d", "p1");
-        PipelineEvent good2 = pipeline.submit("k-good-2", "agg-good", "d", "p2");
 
         awaitStatus(pipeline, bad.eventId, EventStatus.DEAD, 10_000);
         PipelineEvent g1 = awaitStatus(pipeline, good1.eventId, EventStatus.ACKED, 10_000);

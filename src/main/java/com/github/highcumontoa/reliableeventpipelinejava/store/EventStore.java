@@ -9,8 +9,11 @@ import com.github.highcumontoa.reliableeventpipelinejava.core.EffectRecord;
 import com.github.highcumontoa.reliableeventpipelinejava.core.EffectState;
 import com.github.highcumontoa.reliableeventpipelinejava.core.EventStatus;
 import com.github.highcumontoa.reliableeventpipelinejava.core.FailureKind;
+import com.github.highcumontoa.reliableeventpipelinejava.core.AggregateBacklog;
+import com.github.highcumontoa.reliableeventpipelinejava.core.BacklogView;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineEvent;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineStats;
+import com.github.highcumontoa.reliableeventpipelinejava.pipeline.BacklogLimitExceededException;
 import com.github.highcumontoa.reliableeventpipelinejava.pipeline.EventNotFoundException;
 import com.github.highcumontoa.reliableeventpipelinejava.pipeline.IllegalRedeliveryException;
 import java.io.IOException;
@@ -29,6 +32,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 进程内可恢复存储：内存索引 + JSON 快照落盘。
@@ -37,6 +42,8 @@ import java.util.UUID;
  * 进程重启后从快照恢复，未完成的事件可继续处理。
  */
 public class EventStore {
+
+    private static final Logger log = LoggerFactory.getLogger(EventStore.class);
 
     private final Path storeFile;
     private final ObjectMapper mapper;
@@ -47,11 +54,29 @@ public class EventStore {
     private final Map<String, BusinessRecord> businessRecords = new LinkedHashMap<>();
     private final Map<String, EffectRecord> effects = new HashMap<>();
     private final Map<String, Long> nextSeqByAggregate = new HashMap<>();
+    /** 被暂停投递的聚合集合；暂停期间其事件不参与认领，状态持久化以便重启保留。 */
+    private final Set<String> pausedAggregates = new HashSet<>();
+    /** 延迟等待上限；null 或 <=0 表示不限制。 */
+    private Duration maxDelay;
+    /** 单聚合未完成事件数上限；<=0 表示不限制。 */
+    private int maxBacklogPerAggregate;
 
     public EventStore(Path storeFile) {
         this.storeFile = storeFile;
         this.mapper = new ObjectMapper().findAndRegisterModules()
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
+
+    public void setMaxDelay(Duration maxDelay) {
+        synchronized (lock) {
+            this.maxDelay = maxDelay;
+        }
+    }
+
+    public void setMaxBacklogPerAggregate(int maxBacklogPerAggregate) {
+        synchronized (lock) {
+            this.maxBacklogPerAggregate = maxBacklogPerAggregate;
+        }
     }
 
     /** 启动时加载快照；文件不存在则视为空库。 */
@@ -67,6 +92,7 @@ public class EventStore {
                 businessRecords.clear();
                 effects.clear();
                 nextSeqByAggregate.clear();
+                pausedAggregates.clear();
                 for (PipelineEvent e : nullToEmpty(snapshot.events)) {
                     events.put(e.eventId, e);
                     eventIdByIdempotencyKey.put(e.idempotencyKey, e.eventId);
@@ -80,6 +106,9 @@ public class EventStore {
                 if (snapshot.nextSeqByAggregate != null) {
                     nextSeqByAggregate.putAll(snapshot.nextSeqByAggregate);
                 }
+                if (snapshot.pausedAggregates != null) {
+                    pausedAggregates.addAll(snapshot.pausedAggregates);
+                }
             } catch (IOException e) {
                 throw new UncheckedIOException("加载存储快照失败: " + storeFile, e);
             }
@@ -92,10 +121,24 @@ public class EventStore {
      */
     public PipelineEvent commitBusinessWithEvent(String idempotencyKey, String aggregateId,
             String businessData, String payload, Instant now) {
+        return commitBusinessWithEvent(idempotencyKey, aggregateId, businessData, payload, null, now);
+    }
+
+    /**
+     * 业务写入与事件入队的原子提交，可指定最早可投递时刻 notBefore。
+     * 积压达到上限时在任何写入之前抛出 {@link BacklogLimitExceededException}，
+     * 业务记录与事件都不会落库，不存在半截状态；幂等重复提交直接返回原事件，不受上限影响。
+     */
+    public PipelineEvent commitBusinessWithEvent(String idempotencyKey, String aggregateId,
+            String businessData, String payload, Instant notBefore, Instant now) {
         synchronized (lock) {
             String existingId = eventIdByIdempotencyKey.get(idempotencyKey);
             if (existingId != null) {
                 return copy(events.get(existingId));
+            }
+            int backlog = countUnfinishedLocked(aggregateId);
+            if (maxBacklogPerAggregate > 0 && backlog >= maxBacklogPerAggregate) {
+                throw new BacklogLimitExceededException(aggregateId, backlog, maxBacklogPerAggregate);
             }
             BusinessRecord record = new BusinessRecord();
             record.idempotencyKey = idempotencyKey;
@@ -112,7 +155,9 @@ public class EventStore {
             event.status = EventStatus.PENDING;
             event.deliveryAttempts = 0;
             event.redeliveries = 0;
-            event.nextAttemptAt = now;
+            event.notBefore = notBefore;
+            // nextAttemptAt 同时承载“延迟到期/退避到期”的最早可认领时刻。
+            event.nextAttemptAt = notBefore != null && notBefore.isAfter(now) ? notBefore : now;
             event.createdAt = now;
             event.updatedAt = now;
 
@@ -125,24 +170,51 @@ public class EventStore {
         }
     }
 
+    /** 统计某聚合尚未处理完（PENDING/IN_FLIGHT）的事件数。 */
+    private int countUnfinishedLocked(String aggregateId) {
+        int n = 0;
+        for (PipelineEvent e : events.values()) {
+            if (e.aggregateId.equals(aggregateId)
+                    && (e.status == EventStatus.PENDING || e.status == EventStatus.IN_FLIGHT)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     /**
-     * 认领一个可投递事件。
-     * 先把超时未确认的 IN_FLIGHT 事件回收为 PENDING（重新认领），
-     * 再跳过存在在途事件的聚合，保证同一聚合按提交顺序逐个投递。
+     * 认领一个可投递事件。认领规则：
+     * 1) 先把超时未确认的 IN_FLIGHT 事件回收为 PENDING；
+     * 2) 延迟事件等待超过 {@code maxDelay} 上限的，进入死信（DELAY_LIMIT_EXCEEDED）；
+     * 3) 存在在途事件、被暂停的聚合整体跳过；
+     * 4) 其余每个聚合只有其队头（seq 最小的 PENDING）且已到可认领时刻的事件可被认领，
+     *    从而保证同一聚合严格按提交顺序投递，后到的延迟事件即便已到期也不能越过队头。
      */
     public Optional<PipelineEvent> claimNext(String owner, Duration claimTimeout, Instant now) {
         synchronized (lock) {
             boolean changed = reclaimExpiredLocked(now);
-            Set<String> busyAggregates = new HashSet<>();
+            changed |= sweepOverdueDelaysLocked(now);
+
+            Set<String> blockedAggregates = new HashSet<>();
             for (PipelineEvent e : events.values()) {
                 if (e.status == EventStatus.IN_FLIGHT) {
-                    busyAggregates.add(e.aggregateId);
+                    blockedAggregates.add(e.aggregateId);
+                }
+            }
+            Map<String, Long> headSeqByAggregate = new HashMap<>();
+            for (PipelineEvent e : events.values()) {
+                if (e.status == EventStatus.PENDING
+                        && !blockedAggregates.contains(e.aggregateId)
+                        && !pausedAggregates.contains(e.aggregateId)) {
+                    headSeqByAggregate.merge(e.aggregateId, e.seq, Math::min);
                 }
             }
             for (PipelineEvent e : events.values()) {
                 if (e.status != EventStatus.PENDING
-                        || busyAggregates.contains(e.aggregateId)
-                        || e.nextAttemptAt.isAfter(now)) {
+                        || pausedAggregates.contains(e.aggregateId)
+                        || blockedAggregates.contains(e.aggregateId)
+                        || e.nextAttemptAt.isAfter(now)
+                        || headSeqByAggregate.getOrDefault(e.aggregateId, Long.MIN_VALUE) != e.seq) {
                     continue;
                 }
                 e.status = EventStatus.IN_FLIGHT;
@@ -158,6 +230,32 @@ public class EventStore {
             }
             return Optional.empty();
         }
+    }
+
+    /**
+     * 延迟事件等待上限处理：仅对仍在“按业务指定时间等待”（携带 notBefore 且尚未到期）
+     * 的 PENDING 事件生效；等待时长 = now - createdAt。因队头未处理完而排队的事件不视为挂死。
+     */
+    private boolean sweepOverdueDelaysLocked(Instant now) {
+        if (maxDelay == null || maxDelay.isZero() || maxDelay.isNegative()) {
+            return false;
+        }
+        boolean changed = false;
+        for (PipelineEvent e : events.values()) {
+            if (e.status == EventStatus.PENDING
+                    && e.notBefore != null
+                    && e.notBefore.isAfter(now)
+                    && e.createdAt.plus(maxDelay).isBefore(now)) {
+                e.status = EventStatus.DEAD;
+                e.deadReason = DeadReason.DELAY_LIMIT_EXCEEDED;
+                e.lastError = "延迟等待超过上限 " + maxDelay;
+                e.updatedAt = now;
+                changed = true;
+                log.warn("延迟事件等待超过上限, 转入死信 eventId={} aggregate={} seq={} createdAt={} maxDelay={}",
+                        e.eventId, e.aggregateId, e.seq, e.createdAt, maxDelay);
+            }
+        }
+        return changed;
     }
 
     /** 确认处理成功。仅当前认领持有者可确认。 */
@@ -214,15 +312,80 @@ public class EventStore {
                 throw new IllegalRedeliveryException(
                         "仅 DEAD 状态可重投, 事件 " + eventId + " 当前状态: " + e.status);
             }
+            boolean wasDelayCapped = e.deadReason == DeadReason.DELAY_LIMIT_EXCEEDED;
             e.status = EventStatus.PENDING;
             e.deliveryAttempts = 0;
             e.redeliveries++;
             e.deadReason = null;
             e.lastError = null;
+            // 因延迟超限死信的事件，重投代表运维显式决定立即投递，清除业务等待时间，
+            // 否则 notBefore 仍在未来会立刻再次触发上限死信。
+            if (wasDelayCapped) {
+                e.notBefore = null;
+            }
             e.nextAttemptAt = now;
             e.updatedAt = now;
             persistLocked();
             return copy(e);
+        }
+    }
+
+    /** 暂停某聚合的投递：其事件不再被认领，其他聚合不受影响；已在途的事件仍可正常确认。 */
+    public void pauseAggregate(String aggregateId, Instant now) {
+        synchronized (lock) {
+            if (pausedAggregates.add(aggregateId)) {
+                persistLocked();
+            }
+        }
+    }
+
+    /** 恢复投递：从暂停前的队头位置按序继续，不跳序、不计失败。 */
+    public void resumeAggregate(String aggregateId, Instant now) {
+        synchronized (lock) {
+            if (pausedAggregates.remove(aggregateId)) {
+                persistLocked();
+            }
+        }
+    }
+
+    public boolean isAggregatePaused(String aggregateId) {
+        synchronized (lock) {
+            return pausedAggregates.contains(aggregateId);
+        }
+    }
+
+    /**
+     * 积压水位：按聚合与全局给出未完成事件数及最久积压时长。
+     * 时长以“当前时刻 - 最早一条未完成事件的创建时刻”计算。
+     */
+    public BacklogView backlog(Instant now) {
+        synchronized (lock) {
+            Map<String, Integer> counts = new LinkedHashMap<>();
+            Map<String, Instant> oldest = new LinkedHashMap<>();
+            for (PipelineEvent e : events.values()) {
+                if (e.status != EventStatus.PENDING && e.status != EventStatus.IN_FLIGHT) {
+                    continue;
+                }
+                counts.merge(e.aggregateId, 1, Integer::sum);
+                oldest.merge(e.aggregateId, e.createdAt, (a, b) -> a.isBefore(b) ? a : b);
+            }
+            List<AggregateBacklog> list = new ArrayList<>();
+            int globalCount = 0;
+            Instant globalOldest = null;
+            for (Map.Entry<String, Integer> en : counts.entrySet()) {
+                String agg = en.getKey();
+                Instant oldAt = oldest.get(agg);
+                Duration age = oldAt == null ? Duration.ZERO : Duration.between(oldAt, now);
+                list.add(new AggregateBacklog(agg, en.getValue(), age, oldAt,
+                        pausedAggregates.contains(agg)));
+                globalCount += en.getValue();
+                if (oldAt != null && (globalOldest == null || oldAt.isBefore(globalOldest))) {
+                    globalOldest = oldAt;
+                }
+            }
+            Duration globalAge = globalOldest == null
+                    ? Duration.ZERO : Duration.between(globalOldest, now);
+            return new BacklogView(globalCount, globalAge, list);
         }
     }
 
@@ -351,6 +514,7 @@ public class EventStore {
         snapshot.businessRecords = new ArrayList<>(businessRecords.values());
         snapshot.effects = new ArrayList<>(effects.values());
         snapshot.nextSeqByAggregate = new HashMap<>(nextSeqByAggregate);
+        snapshot.pausedAggregates = new HashSet<>(pausedAggregates);
         try {
             Path parent = storeFile.toAbsolutePath().getParent();
             if (parent != null) {
@@ -387,5 +551,6 @@ public class EventStore {
         public List<BusinessRecord> businessRecords;
         public List<EffectRecord> effects;
         public Map<String, Long> nextSeqByAggregate;
+        public Set<String> pausedAggregates;
     }
 }

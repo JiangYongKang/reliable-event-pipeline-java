@@ -2,12 +2,14 @@ package com.github.highcumontoa.reliableeventpipelinejava.pipeline;
 
 import com.github.highcumontoa.reliableeventpipelinejava.core.ClaimDecision;
 import com.github.highcumontoa.reliableeventpipelinejava.core.FailureKind;
+import com.github.highcumontoa.reliableeventpipelinejava.core.BacklogView;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineEvent;
 import com.github.highcumontoa.reliableeventpipelinejava.core.PipelineStats;
 import com.github.highcumontoa.reliableeventpipelinejava.handler.EffectContext;
 import com.github.highcumontoa.reliableeventpipelinejava.handler.EventHandler;
 import com.github.highcumontoa.reliableeventpipelinejava.handler.EventProcessingException;
 import com.github.highcumontoa.reliableeventpipelinejava.store.EventStore;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -35,6 +37,9 @@ public class EventPipeline {
     public EventPipeline(EventStore store, PipelineProperties properties) {
         this.store = store;
         this.properties = properties;
+        // 将投递时机相关上限统一下发给存储层（限流判定与延迟 sweep 在锁内执行）。
+        store.setMaxDelay(properties.getMaxDelay());
+        store.setMaxBacklogPerAggregate(properties.getMaxBacklogPerAggregate());
     }
 
     /** 注册业务处理器并启动派发线程。 */
@@ -74,6 +79,46 @@ public class EventPipeline {
     /** 业务写入与事件入队的原子提交；重复幂等键不产生重复事件。 */
     public PipelineEvent submit(String idempotencyKey, String aggregateId, String businessData, String payload) {
         return store.commitBusinessWithEvent(idempotencyKey, aggregateId, businessData, payload, Instant.now());
+    }
+
+    /**
+     * 延迟提交：指定最早可投递时刻 notBefore，时间未到之前事件不会被认领。
+     * 若该聚合积压已达 {@code pipeline.max-backlog-per-aggregate} 上限，
+     * 抛出 {@link BacklogLimitExceededException}，业务数据与事件均不落库。
+     */
+    public PipelineEvent submitDelayed(String idempotencyKey, String aggregateId, String businessData,
+            String payload, Instant notBefore) {
+        return store.commitBusinessWithEvent(idempotencyKey, aggregateId, businessData,
+                payload, notBefore, Instant.now());
+    }
+
+    /** 延迟提交的相对时间版本：最早可投递时刻 = 当前 + delay。 */
+    public PipelineEvent submitDelayed(String idempotencyKey, String aggregateId, String businessData,
+            String payload, Duration delay) {
+        Instant now = Instant.now();
+        return store.commitBusinessWithEvent(idempotencyKey, aggregateId, businessData,
+                payload, delay == null ? null : now.plus(delay), now);
+    }
+
+    /** 暂停某聚合的投递；其他聚合照常处理。 */
+    public void pauseAggregate(String aggregateId) {
+        store.pauseAggregate(aggregateId, Instant.now());
+        log.info("聚合投递已暂停 aggregate={}", aggregateId);
+    }
+
+    /** 恢复某聚合的投递，从暂停前队头位置按序继续。 */
+    public void resumeAggregate(String aggregateId) {
+        store.resumeAggregate(aggregateId, Instant.now());
+        log.info("聚合投递已恢复 aggregate={}", aggregateId);
+    }
+
+    public boolean isAggregatePaused(String aggregateId) {
+        return store.isAggregatePaused(aggregateId);
+    }
+
+    /** 查看按聚合与全局的积压水位（未完成数量、最久积压时长）。 */
+    public BacklogView backlog() {
+        return store.backlog(Instant.now());
     }
 
     /** 死信重投；状态非法时抛 IllegalRedeliveryException。 */

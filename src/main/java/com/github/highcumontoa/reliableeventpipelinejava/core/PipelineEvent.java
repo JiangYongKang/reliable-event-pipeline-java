@@ -17,6 +17,8 @@ public class PipelineEvent {
     public String claimedBy;
     public Instant claimExpiresAt;
     public Instant nextAttemptAt;
+    /** 业务指定的最早可认领时刻；为空表示立即可投递。 */
+    public Instant notBefore;
     public Instant createdAt;
     public Instant updatedAt;
 
